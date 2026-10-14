@@ -3,12 +3,22 @@ import ollama
 import time
 
 
-prompt = "Explain why the sky appears blue in simple terms."
+# prompt = "Explain why the sky appears blue in simple terms."
+# prompt = (
+#     "A notebook costs $5 and a pen costs $2. "
+#     "What is the total cost of 3 notebooks and 4 pens? "
+#     "Explain your calculation."
+# )
 
-model = "qwen2.5:7b"
-
+prompt = (
+    
+    "Return ONLY a valid JSON object with the keys "
+    "name, age, and city, using the values Ali, 25, "
+    "and Lahore. Do not use Markdown."
+)
+# model = "qwen2.5:7b"
+model = "llama3.1:8b"
 temperature = 0
-
 top_k = 40
 top_p = 0.9
 
