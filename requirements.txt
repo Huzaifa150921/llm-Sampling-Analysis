@@ -1,4 +1,2 @@
 ollama
-pandas
-numpy
-matplotlib
+
