@@ -1,190 +1,507 @@
-
-import ollama
-import time
 import json
 import re
-import pandas as pd
+import time
+from collections import Counter
+from pathlib import Path
 
-# 1. Models and prompts
-models = ["llama3.1:8b", "qwen2.5:7b"]
-repeats = 3
+import matplotlib.pyplot as plt
+import numpy as np
+import ollama
 
-prompts = {
-    "JSON": 'Return only JSON: {"name":"Ali","age":25,"city":"Lahore"}',
-    "Arithmetic": "3 notebooks cost $5 each and 4 pens cost $2 each. What is the total? Show the calculation.",
-    "Factual": "What is the capital of Pakistan and its national language?",
-    "Creative": "Write a short slogan for a student productivity app."
+MODELS = ["llama3.1:8b", "qwen2.5:7b"]
+REPEATS = 3
+NUM_PREDICT = 200
+NUM_GPU = 0
+
+BASE_TEMPERATURE = 0.2
+BASE_TOP_K = 40
+BASE_TOP_P = 0.9
+
+OUTPUT_DIR = Path("sampling_graphs")
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+PROMPTS = {
+    "json": {
+        "prompt": 'Return only valid JSON with exactly these keys: "name", "age", "city". Use name="Ali", age=20, city="Lahore".',
+        "type": "json",
+    },
+    "math": {
+        "prompt": "Calculate 15 + 8. Return only the answer.",
+        "type": "math",
+    },
+    "factual": {
+        "prompt": "What is the capital of Pakistan, and what is its national language? Answer in one sentence.",
+        "type": "factual",
+    },
+    "creative": {
+        "prompt": "Write a short, original story about a robot that discovers a garden on Mars.",
+        "type": "creative",
+    },
 }
 
-# 2. Sampling configurations
-configs = [
-    {"name": "Baseline", "temperature": 0, "top_k": 40, "top_p": 0.9},
-    {"name": "High_Temperature", "temperature": 0.8, "top_k": 40, "top_p": 0.9},
-    {"name": "Low_Top_K", "temperature": 0, "top_k": 10, "top_p": 0.9},
-    {"name": "Low_Top_P", "temperature": 0, "top_k": 40, "top_p": 0.5}
-]
+EXPERIMENTS = {
+    "Temperature": [
+        {
+            "label": "Low (0.0)",
+            "temperature": 0.0,
+            "top_k": BASE_TOP_K,
+            "top_p": BASE_TOP_P,
+        },
+        {
+            "label": "High (0.8)",
+            "temperature": 0.8,
+            "top_k": BASE_TOP_K,
+            "top_p": BASE_TOP_P,
+        },
+    ],
+    "Top-K": [
+        {
+            "label": "Low (10)",
+            "temperature": BASE_TEMPERATURE,
+            "top_k": 10,
+            "top_p": BASE_TOP_P,
+        },
+        {
+            "label": "High (80)",
+            "temperature": BASE_TEMPERATURE,
+            "top_k": 80,
+            "top_p": BASE_TOP_P,
+        },
+    ],
+    "Top-P": [
+        {
+            "label": "Low (0.5)",
+            "temperature": BASE_TEMPERATURE,
+            "top_k": BASE_TOP_K,
+            "top_p": 0.5,
+        },
+        {
+            "label": "High (0.95)",
+            "temperature": BASE_TEMPERATURE,
+            "top_k": BASE_TOP_K,
+            "top_p": 0.95,
+        },
+    ],
+}
 
-results = []
 
-# 3. Run experiments
-for model in models:
-    for config in configs:
-        for prompt_name, prompt in prompts.items():
-            for repeat in range(repeats):
+def generate_response(model, prompt, options):
+    start_time = time.perf_counter()
 
-                start = time.perf_counter()
+    try:
+        result = ollama.generate(
+            model=model,
+            prompt=prompt,
+            stream=False,
+            options=options,
+        )
 
-                try:
-                    output = ollama.generate(
-                        model=model,
-                        prompt=prompt,
-                        stream=False,
-                        options={
-                            "temperature": config["temperature"],
-                            "top_k": config["top_k"],
-                            "top_p": config["top_p"],
-                            "num_predict": 200,
-                            "num_gpu": 0,
-                            "seed": 42
-                        }
-                    )
+        return {
+            "response": result.get("response", "").strip(),
+            "time": time.perf_counter() - start_time,
+            "error": None,
+        }
 
-                    answer = output["response"].strip()
-                    error = ""
+    except Exception as error:
+        return {
+            "response": "",
+            "time": time.perf_counter() - start_time,
+            "error": str(error),
+        }
 
-                except Exception as e:
-                    answer = ""
-                    error = str(e)
 
-                elapsed = time.perf_counter() - start
+def validate_json_structure(response):
+    try:
+        cleaned = response.strip()
 
-                # 4. Evaluate JSON validity
-                json_valid = None
-                correct = None
+        if cleaned.startswith("```"):
+            cleaned = re.sub(
+                r"^```(?:json)?\s*",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+            cleaned = re.sub(r"\s*```$", "", cleaned)
 
-                if prompt_name == "JSON":
-                    try:
-                        data = json.loads(answer)
-                        json_valid = isinstance(data, dict)
-                        correct = (
-                            json_valid
-                            and data.get("name") == "Ali"
-                            and data.get("age") == 25
-                            and data.get("city") == "Lahore"
-                        )
-                    except (json.JSONDecodeError, TypeError):
-                        json_valid = False
-                        correct = False
+        data = json.loads(cleaned)
 
-                # 5. Check arithmetic answer
-                elif prompt_name == "Arithmetic":
-                    correct = all(
-                        re.search(pattern, answer)
-                        for pattern in [r"\b23\b", r"\b15\b", r"\b8\b"]
-                    )
+        return (
+            isinstance(data, dict)
+            and set(data.keys()) == {"name", "age", "city"}
+            and data.get("name") == "Ali"
+            and str(data.get("age")) == "20"
+            and data.get("city") == "Lahore"
+        )
 
-                # 6. Basic factual check
-                elif prompt_name == "Factual":
-                    correct = (
-                        "islamabad" in answer.lower()
-                        and "urdu" in answer.lower()
-                    )
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return False
 
-                results.append({
-                    "Model": model,
-                    "Configuration": config["name"],
-                    "Prompt": prompt_name,
-                    "Repeat": repeat + 1,
-                    "Temperature": config["temperature"],
-                    "Top_K": config["top_k"],
-                    "Top_P": config["top_p"],
-                    "Time": round(elapsed, 3),
-                    "JSON_Valid": json_valid,
-                    "Correct": correct,
-                    "Response": answer,
-                    "Error": error
+
+def evaluate_response(prompt_type, response):
+    if not response:
+        return {
+            "json_valid": None,
+            "math_correct": None,
+            "factual_score": None,
+        }
+
+    json_valid = None
+    math_correct = None
+    factual_score = None
+
+    if prompt_type == "json":
+        json_valid = validate_json_structure(response)
+
+    elif prompt_type == "math":
+        numbers = re.findall(r"-?\d+(?:\.\d+)?", response)
+        math_correct = bool(
+            numbers and float(numbers[-1]) == 23
+        )
+
+    elif prompt_type == "factual":
+        normalized = response.lower()
+        score = 0
+
+        if "islamabad" in normalized:
+            score += 50
+
+        if "urdu" in normalized:
+            score += 50
+
+        factual_score = score
+
+    return {
+        "json_valid": json_valid,
+        "math_correct": math_correct,
+        "factual_score": factual_score,
+    }
+
+
+def calculate_determinism(responses):
+    normalized = [
+        " ".join(response.lower().split())
+        for response in responses
+        if response
+    ]
+
+    if not normalized:
+        return 0.0
+
+    most_common_count = Counter(normalized).most_common(1)[0][1]
+
+    return (most_common_count / len(normalized)) * 100
+
+
+def run_single_experiment(model, settings):
+    options = {
+        "temperature": settings["temperature"],
+        "top_k": settings["top_k"],
+        "top_p": settings["top_p"],
+        "num_predict": NUM_PREDICT,
+        "num_gpu": NUM_GPU,
+    }
+
+    results = {
+        "responses": {},
+        "times": [],
+        "json_validity": [],
+        "math_accuracy": [],
+        "factual_scores": [],
+        "errors": [],
+    }
+
+    for prompt_name, prompt_info in PROMPTS.items():
+        prompt_responses = []
+
+        for repeat in range(REPEATS):
+            result = generate_response(
+                model,
+                prompt_info["prompt"],
+                options,
+            )
+
+            response = result["response"]
+
+            if result["error"]:
+                results["errors"].append({
+                    "prompt": prompt_name,
+                    "repeat": repeat + 1,
+                    "error": result["error"],
                 })
 
                 print(
-                    model, config["name"], prompt_name,
-                    "Run:", repeat + 1,
-                    "Time:", round(elapsed, 2), "seconds"
+                    f"ERROR | Model: {model} | "
+                    f"Prompt: {prompt_name} | "
+                    f"Repeat: {repeat + 1} | "
+                    f"{result['error']}"
                 )
-                print("Response:", answer)
 
-# 7. Save all individual responses
-df = pd.DataFrame(results)
-df.to_csv("sampling_raw_results.csv", index=False)
+            results["times"].append(result["time"])
 
-# 8. Calculate evaluation metrics
-summary = []
-
-for (model, config_name), group in df.groupby(
-    ["Model", "Configuration"]
-):
-    # Determinism: percentage matching the most common response
-    consistency_scores = []
-
-    for _, prompt_group in group.groupby("Prompt"):
-        responses = prompt_group["Response"]
-        responses = responses[responses != ""]
-
-        if len(responses) > 0:
-            most_common_count = responses.value_counts().max()
-            consistency_scores.append(
-                most_common_count / len(responses) * 100
+            evaluation = evaluate_response(
+                prompt_info["type"],
+                response,
             )
 
+            if prompt_info["type"] == "json":
+                results["json_validity"].append(
+                    bool(evaluation["json_valid"])
+                )
+
+            if evaluation["math_correct"] is not None:
+                results["math_accuracy"].append(
+                    evaluation["math_correct"]
+                )
+
+            if evaluation["factual_score"] is not None:
+                results["factual_scores"].append(
+                    evaluation["factual_score"]
+                )
+
+            prompt_responses.append(response)
+
+            print(
+                f"Model: {model} | "
+                f"Prompt: {prompt_name} | "
+                f"Repeat: {repeat + 1}"
+            )
+            print(f"Response: {response or '[No response]'}")
+            print("-" * 70)
+
+        results["responses"][prompt_name] = prompt_responses
+
+    determinism_values = [
+        calculate_determinism(responses)
+        for responses in results["responses"].values()
+        if responses
+    ]
+
     determinism = (
-        round(sum(consistency_scores) / len(consistency_scores), 2)
-        if consistency_scores else None
+        float(np.mean(determinism_values))
+        if determinism_values
+        else 0.0
     )
 
-    # JSON validity percentage
-    json_rows = group[group["Prompt"] == "JSON"]
-    json_rate = json_rows["JSON_Valid"].mean() * 100
+    json_validity = (
+        float(np.mean(results["json_validity"])) * 100
+        if results["json_validity"]
+        else 0.0
+    )
 
-    # Accuracy on prompts with automatic checks
-    checked = group[group["Correct"].notna()]
-    accuracy = checked["Correct"].mean() * 100
+    math_accuracy = (
+        float(np.mean(results["math_accuracy"])) * 100
+        if results["math_accuracy"]
+        else 0.0
+    )
 
-    # Average response time
-    avg_time = group["Time"].mean()
+    factual_accuracy = (
+        float(np.mean(results["factual_scores"]))
+        if results["factual_scores"]
+        else 0.0
+    )
 
-    summary.append({
-        "Model": model,
-        "Configuration": config_name,
-        "Determinism_Percent": round(determinism, 2),
-        "JSON_Validity_Percent": round(json_rate, 2),
-        "Checked_Answer_Accuracy_Percent": round(accuracy, 2),
-        "Average_Time_Seconds": round(avg_time, 3)
-    })
-
-summary = pd.DataFrame(summary)
-
-# 9. Compare each configuration against its baseline
-baseline = summary[summary["Configuration"] == "Baseline"]
-
-for metric in [
-    "Determinism_Percent",
-    "JSON_Validity_Percent",
-    "Checked_Answer_Accuracy_Percent",
-    "Average_Time_Seconds"
-]:
-    baseline_values = baseline.set_index("Model")[metric].to_dict()
-
-    summary[metric + "_Change"] = summary.apply(
-        lambda row: round(
-            row[metric] - baseline_values[row["Model"]], 2
+    return {
+        "determinism": determinism,
+        "json_validity": json_validity,
+        "math_accuracy": math_accuracy,
+        "factual_accuracy": factual_accuracy,
+        "hallucination_proxy": 100.0 - factual_accuracy,
+        "average_response_time": (
+            float(np.mean(results["times"]))
+            if results["times"]
+            else 0.0
         ),
-        axis=1
+        "responses": results["responses"],
+        "errors": results["errors"],
+    }
+
+
+def run_all_experiments():
+    all_results = {}
+
+    for model in MODELS:
+        all_results[model] = {}
+
+        for parameter, configurations in EXPERIMENTS.items():
+            all_results[model][parameter] = {}
+
+            for configuration in configurations:
+                label = configuration["label"]
+
+                print("\n" + "=" * 80)
+                print(f"Model: {model}")
+                print(f"Parameter: {parameter}")
+                print(f"Configuration: {label}")
+                print("=" * 80)
+
+                metrics = run_single_experiment(
+                    model,
+                    configuration,
+                )
+
+                all_results[model][parameter][label] = metrics
+
+                print("\nMetrics")
+                print(
+                    f"Determinism: "
+                    f"{metrics['determinism']:.2f}%"
+                )
+                print(
+                    f"JSON Structure Validity: "
+                    f"{metrics['json_validity']:.2f}%"
+                )
+                print(
+                    f"Math Accuracy: "
+                    f"{metrics['math_accuracy']:.2f}%"
+                )
+                print(
+                    f"Factual Keyword Accuracy: "
+                    f"{metrics['factual_accuracy']:.2f}%"
+                )
+                print(
+                    f"Factual Keyword Error Proxy: "
+                    f"{metrics['hallucination_proxy']:.2f}%"
+                )
+                print(
+                    f"Average Response Time: "
+                    f"{metrics['average_response_time']:.2f} seconds"
+                )
+                print(
+                    f"Request errors: {len(metrics['errors'])}"
+                )
+
+    return all_results
+
+
+def plot_metric(
+    all_results,
+    metric_key,
+    metric_title,
+    filename,
+):
+    parameters = list(EXPERIMENTS.keys())
+
+    fig, axes = plt.subplots(
+        1,
+        len(parameters),
+        figsize=(17, 5),
     )
 
-summary.to_csv("sampling_summary.csv", index=False)
+    bar_width = 0.35
+    x_positions = np.arange(2)
 
-print("\n========== FINAL SUMMARY ==========")
-print(summary.to_string(index=False))
+    for axis, parameter in zip(axes, parameters):
+        for model_index, model in enumerate(MODELS):
+            labels = [
+                configuration["label"]
+                for configuration in EXPERIMENTS[parameter]
+            ]
 
-print("\nSaved files:")
-print("sampling_raw_results.csv")
-print("sampling_summary.csv")
+            values = [
+                all_results[model][parameter][label][metric_key]
+                for label in labels
+            ]
+
+            values = [
+                float(value) if np.isfinite(value) else 0.0
+                for value in values
+            ]
+
+            offset = (
+                model_index - (len(MODELS) - 1) / 2
+            ) * bar_width
+
+            bars = axis.bar(
+                x_positions + offset,
+                values,
+                bar_width,
+                label=model,
+            )
+
+            axis.bar_label(
+                bars,
+                labels=[f"{value:.1f}" for value in values],
+                padding=2,
+                fontsize=7,
+            )
+
+        axis.set_title(parameter)
+        axis.set_xticks(x_positions)
+        axis.set_xticklabels(
+            [
+                configuration["label"]
+                for configuration in EXPERIMENTS[parameter]
+            ],
+            fontsize=8,
+        )
+        axis.set_ylabel("Percentage (%)")
+        axis.set_ylim(0, 105)
+        axis.grid(
+            axis="y",
+            linestyle="--",
+            alpha=0.4,
+        )
+        axis.set_axisbelow(True)
+        axis.legend(fontsize=8)
+
+    fig.suptitle(metric_title)
+    fig.tight_layout()
+
+    output_path = OUTPUT_DIR / filename
+
+    fig.savefig(
+        output_path,
+        dpi=300,
+        bbox_inches="tight",
+    )
+
+    plt.close(fig)
+
+    print(f"Graph saved: {output_path.resolve()}")
+
+
+def create_graphs(all_results):
+    plot_metric(
+        all_results,
+        "determinism",
+        "Determinism Comparison Across Sampling Parameters",
+        "Determinism_model_comparison.png",
+    )
+
+    plot_metric(
+        all_results,
+        "json_validity",
+        "JSON Structure Validity Across Sampling Parameters",
+        "JSON_Structure_Validity_model_comparison.png",
+    )
+
+    plot_metric(
+        all_results,
+        "hallucination_proxy",
+        "Factual Keyword Error Rate Proxy Across Sampling Parameters",
+        "Hallucination_Rate_model_comparison.png",
+    )
+
+
+def main():
+    print("LLM Sampling Analysis")
+    print(f"Models: {', '.join(MODELS)}")
+    print(f"Repeats per prompt: {REPEATS}")
+    print(f"Output directory: {OUTPUT_DIR.resolve()}")
+
+    all_results = run_all_experiments()
+    create_graphs(all_results)
+
+    print("\nExperiment completed.")
+    print(
+        f"All three graphs are saved in: "
+        f"{OUTPUT_DIR.resolve()}"
+    )
+    print(
+        "Note: the hallucination graph is only a "
+        "factual-keyword error proxy."
+    )
+
+
+if __name__ == "__main__":
+    main()
